@@ -1,354 +1,448 @@
-#include <iostream>
 #include <vector>
-#include <set>
 #include <functional>
-#include <unordered_set>
+#include <stdexcept>
+#include <iostream>
+#include <string>
 #include <algorithm>
+#include <omp.h>
 
-// Forward declaration: your PriorityStructure from Lemma 3.1
 template <typename T>
-class PriorityStructure;
-
-// Lemma 3.2: BFS up to depth L, returning Dist array.
-// Dist[v] = 0..L if reachable within L steps, or L+1 otherwise.
-std::vector<int> bfs_array(const std::vector<std::vector<int>>& adj, int s, int L) {
-    int n = static_cast<int>(adj.size());
-
-    std::vector<int> dist(n, L + 1);
-
-    // S(0), S(1), ..., S(L)
-    std::vector<std::set<int>> levels(L+1);
-
-    // Initialize
-    dist[s] = 0;
-    levels[0].insert(s);
-
-    // BFS by levels up to depth L
-    // levels are sequential
-    for (int i = 0; i < L; ++i) {
-        const std::set<int>& curr = levels[i];
-        std::set<int>& next = levels[i + 1];
-
-        if (curr.empty()) {
-            break;
-        }
-
-        // within level we parallelize expanding the fringe (conceptually)
-        for (int v : curr) {  // iterate over nodes
-            for (int u : adj[v]) {  // iterate over out-neighbors
-                if (dist[u] > i + 1) {
-                    dist[u] = i + 1;
-                    next.insert(u);
-                }
-            }
-        }
-    }
-    return dist;
-}
-
-
-// Theorem 1.2 Data Structure //
-
-class DynamicSSSP {
+class PriorityStructure {
 public:
-    DynamicSSSP(const std::vector<std::vector<int>>& adjOut, int s, int L)
-        : n(static_cast<int>(adjOut.size())), L(L), s(s), Dist(),
-          Out(adjOut), In(),
-          Scan(), Tv(), Parent(),
-          alive()
-    {
-        // 1) Dist via Lemma 3.2:
-        Dist = bfs_array(Out, s, L);
+    explicit PriorityStructure(int maxPriority)
+        : maxP(maxPriority), root(nullptr) {}
 
-        // 2) Build In(v) as PriorityStructure using in-neighbors:
-        int maxPriority = n;  // priorities in [1..n]
-        std::vector<std::vector<int>> adjOutInv(n);
-        for (int u = 0; u < n; u++) {
-            for (int v : adjOut[u]) {
-                adjOutInv[v].push_back(u);
-            }
+    // **API FUNCTION**
+    // INITIALIZE({(v1, p1), ..., (vl, pl)})
+    // initialize segment tree from list of (value, priority) pairs
+    void initialize(const std::vector<std::pair<T,int>>& elems) {
+        // TODO: in case we ever call initialize multiple times, need to delete original tree
+        root = nullptr;
+
+        if (elems.empty()) {
+            return;
         }
 
-        In.reserve(n);
-        for (int v = 0; v < n; v++) {
-            std::vector<std::pair<int,int>> elems;
-            elems.reserve(adjOutInv[v].size());
-            for (int u : adjOutInv[v]) {
-                // value = u, priority = u+1 (must be in [1..maxPriority])
-                elems.emplace_back(u, u+1);
-            }
-            In.emplace_back(maxPriority);
-            In[v].initialize(elems);
-        }
+        std::vector<std::pair<int,T>> items = elems;
 
-        // 3) Initialize alive-edge set
-        for (int u = 0; u < n; ++u) {
-            for (int v : Out[u]) {
-                alive.insert(encodeEdge(u, v));
-            }
-        }
-
-        // 4) Initialize Scan, Parent, T to form the initial BFS tree T
-        initScanAndTree();
-    }
+        std::sort(items.begin(), items.end(),
+                [](const auto& a, const auto& b) {
+                    return a.second < b.second;  // sort by priority
+                });
 
 
-    // page 10 - Algorithm 1
-    void batchDelete(const std::vector<std::pair<int,int>>& delEdges) {
-        std::vector<bool> parentDeleted(n, false);
-        std::vector<std::pair<int,int>> treeEdges;   // edges from T whose parent is removed
-
-        // First pass
-        for (auto [u, v] : delEdges) { // iterate over delete batch
-            if (u < 0 || u >= n || v < 0 || v >= n) continue;
-
-            long long key = encodeEdge(u, v);
-            auto it = alive.find(key);
-            if (it == alive.end()) {
-                continue;
-            }
-
-            alive.erase(it); // tell the data structure this edge is dead
-            auto &outList = Out[u];
-            outList.erase(std::remove(outList.begin(), outList.end(), v), outList.end());
-
-            // If the edge ei does not belong to T, we remove it from the data structure In(v) and Out(v)
-            // by marking it as an invalid edge. This can be done with a single call of the Set operation
-            // per each edge, requiring an O(1) work and depth. Hence, we are left only with edges from T.
-
-            if (Parent[v] == u) { // parent deleted (tree edge)
-                treeEdges.emplace_back(u, v);
-                parentDeleted[v] = true;
-                // Remove v from children list Tv[u]
-                auto &kids = Tv[u];
-                kids.erase(std::remove(kids.begin(), kids.end(), v), kids.end());
-                Parent[v] = -1;
-            }
-        }
-
-        // Second Pass
-        for (auto [u, v] : treeEdges) {
-
-            // predicate for NextWith
-            auto predicate = [this, v](const int& w) -> bool {
-                if (Dist[w] != Dist[v] - 1) return false;
-                long long key = encodeEdge(w, v);
-                return alive.find(key) != alive.end();
-            };
-
-            Scan[v] = In[v].nextWith(Scan[v], predicate);
-
-            if (Scan[v] != In[v].size()+1) {
-                int w = In[v].query(Scan[v]);
-                Parent[v] = w;
-                Tv[w].push_back(v);
-                parentDeleted[v] = false;
-            }
-        }
-
-        std::unordered_set<int> U;  // Algorithm 1 line 3
-
-
-        // ---- Phases i = 0..L (Algorithm 1 lines 4–15) ----
-        // Phase i:     "resolve" any vertices in U whose true distance is exactly i
-        //              add to U any vertices who may have distance i+1 but incorrectly recorded
-        // Invariants:  any vertex whose true distance is AT MOST i is either in U or already resolved
-        //              U contains only elements of distance at least i
-        //              Every element of U has its distance marked as i  (in the ideal version)
-        for (int i = 0; i <= L; i++) {
-            std::unordered_set<int> Unew;
-
-            // parallel loop line 6-11
-            for (int v : U) {
-
-                // predicate for NextWith
-                auto predicate = [this, v](const int& w) -> bool {
-                    if (Dist[w] != Dist[v] - 1) return false;
-                    long long key = encodeEdge(w, v);
-                    return alive.find(key) != alive.end();
-                };
-
-                // Line 7: rescan from current Scan(v)
-                Scan[v] = In[v].nextWith(Scan[v], predicate);
-
-                if (Scan[v] == In[v].size() + 1) {
-                    // Line 9
-                    Scan[v] = 1;
-
-                    // Line 10
-                    Unew.insert(v);
-
-                    // Line 11
-                    for (int child : Tv[v]) {
-                        Unew.insert(child);
-                    }
-                    Tv[v] = std::vector<int>();
-
-                } else {
-                    int w = In[v].query(Scan[v]);
-                    Parent[v] = w;
-                    Tv[w].push_back(v);
-                }
-            }
-
-            // line 12
-            for (int v=0; v<n; v++) {  // Linear complexity... corrct impl??
-                if (Dist[v] == i + 1 && parentDeleted[v]) {
-                    Unew.insert(v);
-                }  // sufficient for decremental, can simply throw away nodes after they get too far.
-            }
-
-            // line 13
-            U.swap(Unew);
-
-            // parallel loop line 14-15
-            for (int v : U) {
-                Dist[v] = i + 1;
+        #pragma omp parallel
+        {
+            #pragma omp single
+            {
+                root = buildFromSorted(items, 0, items.size(), 1, maxP);
             }
         }
     }
 
 
+    // number of elements currently stored
+    int size() const {
+        if (root) {
+            return root->cnt;
+        } else {
+            return 0;
+        }
+    }
 
-    void debugPrint() const {
-        std::cout << "Dist:\n";
-        for (int v = 0; v < n; ++v) {
-            std::cout << "   Dist[" << v << "] = " << Dist[v] << "\n";
+    // **API FUNCTION**
+    // QUERY(k)
+    // return the element with k-th largest priority
+    T query(int k) const {
+        int n = size();
+        if (k < 1 || k > n) {
+            throw std::out_of_range("QUERY: k out of range");
+        }
+        return queryByRank(root, 1, maxP, k);
+    }
+
+    // **API FUNCTION**
+    // UPDATEVALUE(k, v)
+    // update the value of the element with k-th largest priorit to v.
+    void updateValue(int k, const T& v) {
+        int n = size();
+        if (k < 1 || k > n) {
+            throw std::out_of_range("updateValue: k out of range");
         }
 
-        std::cout << "\nParent (tree T):\n";
-        for (int v = 0; v < n; ++v) {
-            std::cout << v << " -> " << Parent[v] << "\n";
+        updateValueHelper(root, 1, maxP, k, v);
+        return;
+    }
+
+    // **API FUNCTION**
+    // FIND(p)
+    // return the rank (k) and value (v) of the element with priority p
+    std::pair<T,int> find(int p) const {
+        if (p < 1 || p > maxP) {
+            // ERROR
+            throw std::out_of_range("find: priority out of range");
         }
+        int rank = 0;
+        return findByPriority(root, 1, maxP, p, rank);
+    }
+
+    // **API FUNCTION**
+    // UPDATEPRIORITY(k, p)
+    // change the priority of the element with k-th largest priority to p.
+    void updatePriority(int k, int newP) {
+        int n = size();
+        if (k < 1 || k > n) {
+            throw std::out_of_range("updatePriority: k out of range");
+        }
+        if (newP < 1 || newP > maxP) {
+            throw std::out_of_range("updatePriority: newP out of range");
+        }
+        if (presentPriority(root, 1, maxP, newP)) {
+            throw std::logic_error("updatePriority: new priority already present");
+        }
+
+        // Erase old priority, insert new priority
+        T v = erase(root, 1, maxP, k);
+        insert(root, 1, maxP, newP, v);
+        return;
+    }
+
+    // **API FUNCTION**
+    // NEXTWITH(k, f)
+    // returns the smallest j >= k such that f(QUERY(j)) == true,
+    // or size() + 1 if no such j exists.
+    int nextWith(int k, const std::function<bool(const T&)>& f) const {
+        int n = size();
+        if (n == 0) {
+            return 1; // l + 1 where l = 0
+        }
+
+        int p = k;
+        if (p < 1) p = 1;
+        if (p > n) return n + 1;
+
+        int i = 0;
+        while (p <= n) {
+            int len = 1 << i;         // 2^i
+            int end = p + len - 1;
+            if (end > n) end = n;
+
+            // Parallel scan of QUERY(p..end)
+            int best = nextWithRange(p, end, f);
+
+            if (best <= end) {
+                return best;  // found smallest j in this phase
+            }
+
+            p += len; // advance start by 2^i
+            ++i;
+        }
+
+        return n + 1;
+    }
+
+    
+    int nextWithRange(int L, int R, const std::function<bool(const T&)>& f) const {
+        int n = size();
+        if (n == 0) {
+            return 1;
+        }
+
+        // // Clamp range
+        // if (max > n)  max = n;
+        // if (min > max) {
+        //     return n + 1;
+        // }
+
+        int best = n + 1;
+
+        // Parallel loop over j in [L, R].
+        #pragma omp parallel for reduction(min:best)
+        for (int j = L; j <= R; ++j) {
+            const T& val = query(j);
+            if (f(val) && j < best) {
+                best = j;
+            }
+        }
+
+        return best;
     }
 
 
 private:
-    int n;
-    int L;
-    int s;
-    std::vector<int> Dist;
-    std::vector<std::vector<int>> Out;
-    std::vector<PriorityStructure<int>> In;
+    struct Node {
+        int cnt;           // number of elements in this interval
+        bool present;      // is there a value with this priority (meaningful for leaves)
+        T value;           // value at node (if present)
+        Node* left;        // left child
+        Node* right;       // right child
 
-    std::vector<int> Scan;              // Scan(v) represents RANKs within In(v)
-    std::vector<int> Parent;            // T, represented by parent map
-    std::vector<std::vector<int>> Tv;   // T, represented by child map     
+        Node() : cnt(0), present(false), left(nullptr), right(nullptr) {}
+    };
 
-    std::unordered_set<long long> alive;
+    int maxP;           // max priority
+    Node* root;         // root
 
-    static long long encodeEdge(int u, int v) {
-        return (static_cast<long long>(u) << 32) ^
-               static_cast<unsigned int>(v);
+    // create node if null
+    static void ensureNode(Node*& node) {
+        if (!node) {
+            node = new Node();
+        }
     }
 
-    void initScanAndTree() {
-        Scan.assign(n, 0);
-        Parent.assign(n, -1);
-        Tv.assign(n, std::vector<int>());
+    // insert (v, p)
+    // recurse over nodes "node" which span interval ["L", "R"]
+    void insert(Node*& node, int L, int R, int p, const T& v) {
+        ensureNode(node);
+        node->cnt += 1;
 
-        for (int v = 0; v < n; v++) {
+        // base case -- reached leaf
+        if (L == R) {
+            node->present = true;
+            node->value = v;
+            return;
+        }
 
-            int d = Dist[v];
-            if (d == 0 || d > L) {
-                continue;
+        // recursive step
+        int mid = (L + R) / 2;
+        if (p <= mid) {
+            insert(node->left, L, mid, p, v);
+        } else {
+            insert(node->right, mid+1, R, p, v);
+        }
+    }
+
+    // erase element at kth priority (k-th largest), and return its value
+    // recurse over nodes "node" which span interval ["L", "R"]
+    T erase(Node*& node, int L, int R, int k) {
+
+        node->cnt -= 1; // TODO: if we ever reach a node with count 0, we can delete the whole thing to save memory
+                        // Pass down pointer to the node where cnt switched from >1 to =1
+
+        // base case -- reached leaf
+        if (L == R) {
+            node->present = false;
+            return node->value;
+        }
+
+        int mid = (L + R) / 2;
+        int rightCount = (node->right ? node->right->cnt : 0);
+        if (rightCount >= k) {
+            // k-th largest is in right subtree
+            return erase(node->right, mid + 1, R, k);
+        } else {
+            // k-th largest is in left subtree
+            return erase(node->left, L, mid, k - rightCount);
+        }
+    }
+
+    // is there an element with priority p?
+    // recurse over nodes "node" which span interval ["L", "R"]
+    bool presentPriority(Node* node, int L, int R, int p) const {
+
+        // base cases
+        if (!node) return false;
+        if (L == R) return node->present;
+
+        // recursive step
+        int mid = (L + R) / 2;
+        if (p <= mid) {
+            return presentPriority(node->left, L, mid, p);
+        }
+        else {
+            return presentPriority(node->right, mid + 1, R, p);
+        }
+
+        // TODO: could terminate early if count==0
+    }
+
+
+    Node* buildFromSorted(const std::vector<std::pair<T,int>>& items,
+                      int start, int end, // indices spanned by items
+                      int L, int R) { // interval spanned by this node
+        
+        if (start >= end) { // Error
+            return nullptr;
+        }
+
+        Node* node = new Node();
+        node->cnt = end - start;  // number of elements in this subtree
+
+        if (L == R) {
+            // Leaf
+            node->present = true;
+            node->value   = items[start].first;
+            // cnt already set to 1
+            return node;
+        }
+
+        int mid = (L + R) / 2;
+
+        
+        auto it = std::lower_bound(items.begin() + start, items.begin() + end, mid + 1,
+            [](const std::pair<T,int>& pr, int value) {
+                return pr.second < value;  // compare priority with mid+1
             }
+        );
+        int m = it - items.begin(); // index of split
 
-            auto predicate = [this, v](const int& w) -> bool {
-                if (w < 0 || w >= n) return false;
-                if (Dist[w] != Dist[v] - 1) return false;
-                long long key = encodeEdge(w, v);
-                return alive.find(key) != alive.end();
-            };
+        Node* leftChild  = nullptr;
+        Node* rightChild = nullptr;
 
-            int pos = In[v].nextWith(1, predicate);
-            int sz  = In[v].size();
+        bool hasLeft  = (start < m);
+        bool hasRight = (m < end);
 
-            if (pos >= 1 && pos <= sz) {
-                int w = In[v].query(pos);
-                Scan[v]   = pos;
-                Parent[v] = w;
-                Tv[w].push_back(v);
-            } else {
-                Scan[v] = sz + 1;
-                Parent[v] = -1;
+        if (hasLeft && hasRight) { // recurse tree-like, spawn new task
+            #pragma omp task shared(leftChild)
+            {
+                leftChild = buildFromSorted(items, start, m, L, mid);
             }
+            rightChild = buildFromSorted(items, m, end, mid + 1, R);
+            #pragma omp taskwait
+        } else { // recurse linearly
+            if (hasLeft) {
+                leftChild = buildFromSorted(items, start, m, L, mid);
+            }
+            if (hasRight) {
+                rightChild = buildFromSorted(items, m, end, mid + 1, R);
+            }
+        }
+
+        node->left  = leftChild;
+        node->right = rightChild;
+        // node->cnt is already correct (end-start).
+        // node->present/value are irrelevant for internal nodes.
+        return node;
+    }
+
+
+
+    // return the value with k-th largest priority
+    T queryByRank(Node* node, int L, int R, int k) const {
+        if (!node || k < 1 || k > node->cnt) {
+            throw std::logic_error("queryByRank: inconsistent tree");
+        }
+
+        if (L == R) {
+            // leaf
+            return node->value;
+        }
+        int mid = (L + R) / 2;
+        int rightCount = (node->right ? node->right->cnt : 0);
+        if (rightCount >= k) {
+            // k-th largest is in right subtree
+            return queryByRank(node->right, mid + 1, R, k);
+        } else {
+            // k-th largest is in left subtree
+            return queryByRank(node->left, L, mid, k - rightCount);
+        }
+    }
+
+    // helper for UPDATEVALUE: update the value of k-th largest element to v
+    void updateValueHelper(Node* node, int L, int R, int k, const T& v) {
+        if (!node || k < 1 || k > node->cnt) {
+            throw std::logic_error("updateValueHelper: inconsistent tree");
+        }
+
+        if (L == R) {
+            // leaf
+            node->value = v;
+            return;
+        }
+        int mid = (L + R) / 2;
+        int rightCount = (node->right ? node->right->cnt : 0);
+        if (rightCount >= k) {
+            // k-th largest is in right subtree
+            updateValueHelper(node->right, mid+1, R, k, v);
+            return;
+        } else {
+            // k-th largest is in left subtree
+            updateValueHelper(node->left, L, mid, k - rightCount, v);
+            return;
+        }
+    }
+
+    // helper for FIND(p)
+    // recurse over nodes "node" which span interval ["L", "R"]
+    // rank = how many elements have priority > p so far
+    std::pair<T,int> findByPriority(Node* node, int L, int R, int p, int rank) const {
+        if (!node || node->cnt == 0) {
+            // ERROR
+
+            throw std::logic_error("findByPriority: priority not present");
+        }
+
+        if (L == R) {
+            if (node->cnt == 0 || !node->present) {
+                // ERROR
+                throw std::logic_error("findByPriority: priority not present at leaf");
+            }
+            return {node->value, rank + 1};
+        }
+
+        int mid = (L + R) / 2;
+        if (p <= mid) {
+            // p in left subtree
+            int rightCount = (node->right ? node->right->cnt : 0);
+            return findByPriority(node->left, L, mid, p, rank + rightCount);
+        } else {
+            // p in right subtree
+            return findByPriority(node->right, mid + 1, R, p, rank);
         }
     }
 };
 
 
+
+
+
+
 int main() {
-    // Example graph:
-    //
-    // 0 -> 1
-    // v    v
-    // 2 -> 3
-    // v    v
-    // 4    5
+    int maxP = 1000;
+    PriorityStructure<int> ps(maxP);
 
-    int n = 6;
-    std::vector<std::vector<int>> adj(n);
-    auto add_edge = [&](int u, int v) {
-        adj[u].push_back(v);
-    };
+    std::vector<std::pair<int,int>> elems;
+    elems.push_back({100, 10});   // value=100, priority=10
+    elems.push_back({200, 150});
+    elems.push_back({300, 999});
+    elems.push_back({400, 500});
+    elems.push_back({500, 1});
+    elems.push_back({600, 750});
+    elems.push_back({700, 250});
+    elems.push_back({800, 900});
+    elems.push_back({900, 333});
+    elems.push_back({1000, 42});
+    elems.push_back({1100, 600});
+    elems.push_back({1200, 700});
+    elems.push_back({1300, 800});
+    elems.push_back({1400, 5});
+    elems.push_back({1500, 444});
+    elems.push_back({1600, 222});
+    elems.push_back({1700, 321});
+    elems.push_back({1800, 888});
+    elems.push_back({1900, 50});
+    elems.push_back({2000, 430});
 
-    add_edge(0, 1);
-    add_edge(0, 2);
-    add_edge(1, 3);
-    add_edge(2, 3);
-    add_edge(2, 4);
-    add_edge(3, 5);
+    ps.initialize(elems);
 
-    int s = 0;
-    int L = 3;
+    std::cout << "Size after initialize: " << ps.size() << "\n\n";
 
-    // Construct the Theorem 1.2 data structure
-    DynamicSSSP dsssp(adj, s, L);
+    // Print elements in order of rank
+    std::cout << "By rank (k-th largest priority):\n";
+    int n = ps.size();
+    for (int k = 1; k <= n; ++k) {
+        int v = ps.query(k);
+        std::cout << "  k=" << k << " -> value=" << v << "\n";
+    }
 
-    std::cout << "Initial structure:\n";
-    dsssp.debugPrint();
-
-    // Example batch deletion
-    std::vector<std::pair<int,int>> delEdges = {{2,3}};
-    dsssp.batchDelete(delEdges);
-
-    std::cout << "\nAfter batchDelete({(2,3)}):\n";
-    dsssp.debugPrint();
-
-
-
-    // Cycle
-
-    n = 5;
-    adj.assign(n, std::vector<int>());
-
-    add_edge(0, 1);
-    add_edge(1, 0);
-    add_edge(0, 4);
-    add_edge(4, 0);
-    add_edge(2, 1);
-    add_edge(1, 2);
-    add_edge(2, 3);
-    add_edge(3, 2);
-    add_edge(4, 3);
-    add_edge(3, 4);
-
-    s = 0;
-    L = 3;
-
-    // Construct the Theorem 1.2 data structure
-    DynamicSSSP dsssp2(adj, s, L);
-
-    std::cout << "Initial structure:\n";
-    dsssp2.debugPrint();
-
-    // Example batch deletion
-    delEdges = {{0,1}, {1,0}};
-    dsssp2.batchDelete(delEdges);
-
-    std::cout << "\nAfter batchDelete({(0,1)}):\n";
-    dsssp2.debugPrint();
+    // Print value and rank returned by find(p)
+    std::cout << "\nBy explicit priority (find):\n";
+    for (const auto& [val, p] : elems) {
+        auto [v, rank] = ps.find(p);
+        std::cout << "  priority=" << p
+                  << " -> value=" << v
+                  << ", rank=" << rank << "\n";
+    }
 
     return 0;
 }
