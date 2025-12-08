@@ -5,18 +5,15 @@
 #include <unordered_set>
 #include <algorithm>
 
-// Forward declaration: your PriorityStructure from Lemma 3.1
+
 template <typename T>
 class PriorityStructure;
 
-// Lemma 3.2: BFS up to depth L, returning Dist array.
-// Dist[v] = 0..L if reachable within L steps, or L+1 otherwise.
 std::vector<int> bfs_array(const std::vector<std::vector<int>>& adj, int s, int L) {
-    int n = static_cast<int>(adj.size());
+    int n = adj.size();
 
     std::vector<int> dist(n, L + 1);
 
-    // S(0), S(1), ..., S(L)
     std::vector<std::set<int>> levels(L+1);
 
     // Initialize
@@ -24,7 +21,6 @@ std::vector<int> bfs_array(const std::vector<std::vector<int>>& adj, int s, int 
     levels[0].insert(s);
 
     // BFS by levels up to depth L
-    // levels are sequential
     for (int i = 0; i < L; ++i) {
         const std::set<int>& curr = levels[i];
         std::set<int>& next = levels[i + 1];
@@ -52,7 +48,7 @@ std::vector<int> bfs_array(const std::vector<std::vector<int>>& adj, int s, int 
 class DynamicSSSP {
 public:
     DynamicSSSP(const std::vector<std::vector<int>>& adjOut, int s, int L)
-        : n(static_cast<int>(adjOut.size())), L(L), s(s), Dist(),
+        : n(adjOut.size()), L(L), s(s), Dist(),
           Out(adjOut), In(),
           Scan(), Tv(), Parent(),
           alive()
