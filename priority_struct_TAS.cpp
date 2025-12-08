@@ -26,17 +26,13 @@ public:
             return;
         }
 
-        // Keep convention: (value, priority)
+        // sort elems as items
         std::vector<std::pair<T,int>> items = elems;
-
-        // sort by priority = .second
         std::sort(items.begin(), items.end(),
                   [](const auto& a, const auto& b) {
                       return a.second < b.second;  // sort by priority
                   });
 
-        // Decide how deep we allow parallel tasking.
-        // At depth d, there are at most 2^d subtrees. We cap d so 2^d <= numThreads.
         int numThreads = omp_get_max_threads();
         int maxParallelDepth = 0;
         while ((1 << maxParallelDepth) < numThreads) {
